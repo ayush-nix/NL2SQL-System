@@ -555,3 +555,38 @@ async function checkHealth() {
         // Server not running yet
     }
 }
+
+// ── Load Army Dataset (pre-built) ─────────────────────────────
+async function loadArmyData() {
+    const btn = document.getElementById("loadArmyBtn");
+    if (!btn) return;
+    const origText = btn.innerHTML;
+    btn.innerHTML = "⏳ Loading...";
+    btn.disabled = true;
+    btn.style.opacity = "0.6";
+
+    try {
+        const res = await fetch("/api/load-army-data", { method: "POST" });
+        if (!res.ok) {
+            const err = await res.json();
+            throw new Error(err.detail || "Failed to load army data");
+        }
+        const data = await res.json();
+        onSchemaLoaded(data);
+        btn.innerHTML = "✅ Loaded!";
+        btn.style.background = "linear-gradient(135deg, rgba(16,185,129,0.2), rgba(5,150,105,0.2))";
+        btn.style.borderColor = "rgba(16,185,129,0.4)";
+        btn.style.color = "#6ee7b7";
+        setTimeout(() => {
+            btn.innerHTML = "🏔️ Reload Army Data";
+            btn.disabled = false;
+            btn.style.opacity = "1";
+        }, 2000);
+    } catch (err) {
+        alert("Error loading army dataset: " + err.message);
+        btn.innerHTML = origText;
+        btn.disabled = false;
+        btn.style.opacity = "1";
+    }
+}
+

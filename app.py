@@ -279,6 +279,88 @@ async def upload_csvs(files: list[UploadFile] = File(...)):
         raise HTTPException(500, f"Error processing CSV files: {str(e)}")
 
 
+@app.post("/api/load-army-data")
+async def load_army_data():
+    """
+    Load the pre-built avalanche prediction dataset from test_data/.
+    No file upload needed — loads directly from the backend.
+    """
+    csv_path = Path(__file__).parent / "test_data" / "avalanche_data.csv"
+    if not csv_path.exists():
+        raise HTTPException(404, "Army dataset not found at test_data/avalanche_data.csv")
+
+    try:
+        content = csv_path.read_bytes()
+        csv_files = {"avalanche_data.csv": content}
+
+        metadata = introspector.load_from_csvs(csv_files)
+        executor.set_connection(metadata.db_connection)
+        cache.clear()
+
+        app_state["schema_loaded"] = True
+        app_state["tables"] = metadata.tables
+        app_state["total_rows"] = sum(metadata.row_counts.values())
+        app_state["upload_time"] = time.strftime("%Y-%m-%d %H:%M:%S")
+
+        schema_summary = []
+        for table in metadata.tables:
+            cols = metadata.columns.get(table, [])
+            col_names = [c.name for c in cols]
+            row_count = metadata.row_counts.get(table, 0)
+            schema_summary.append({
+                "table": table,
+                "columns": col_names,
+                "column_details": [
+                    {
+                        "name": c.name,
+                        "type": c.dtype,
+                        "is_pk": c.is_pk,
+                        "fk_ref": c.fk_ref,
+                        "samples": c.sample_values[:3],
+                    }
+                    for c in cols
+                ],
+                "row_count": row_count,
+            })
+
+        relationships = [
+            {
+                "from": f"{r.from_table}.{r.from_column}",
+                "to": f"{r.to_table}.{r.to_column}",
+                "type": r.rel_type,
+            }
+            for r in metadata.relationships
+        ]
+
+        logger.info(f"Army dataset loaded: {len(metadata.tables)} tables, {app_state['total_rows']} rows")
+
+        return {
+            "success": True,
+            "tables": schema_summary,
+            "relationships": relationships,
+            "total_rows": app_state["total_rows"],
+            "message": f"Army avalanche dataset loaded — {app_state['total_rows']} rows, 152 columns",
+        }
+
+    except Exception as e:
+        logger.error(f"Error loading army data: {e}")
+        raise HTTPException(500, f"Error loading army dataset: {str(e)}")
+
+
+@app.get("/api/download-army-data")
+async def download_army_data():
+    """Download the avalanche prediction CSV file."""
+    csv_path = Path(__file__).parent / "test_data" / "avalanche_data.csv"
+    if not csv_path.exists():
+        raise HTTPException(404, "Army dataset not found")
+    from fastapi.responses import FileResponse
+    return FileResponse(
+        path=str(csv_path),
+        filename="avalanche_data.csv",
+        media_type="text/csv",
+    )
+
+
 @app.post("/api/query", response_model=QueryResponse)
 async def query(req: QueryRequest):
     """
