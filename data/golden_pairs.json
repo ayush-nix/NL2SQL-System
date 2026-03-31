@@ -1,0 +1,82 @@
+[
+    {
+        "id": 1,
+        "question": "Which locations have high avalanche risk?",
+        "sql": "SELECT encrypted_lat, encrypted_lon, avalanche_probability, risk_scale, compound_risk_score FROM avalanche_data WHERE risk_scale >= 4 ORDER BY compound_risk_score DESC",
+        "expected_answer_contains": ["risk_scale", "compound_risk_score"],
+        "category": "SINGLE_TABLE",
+        "difficulty": "easy"
+    },
+    {
+        "id": 2,
+        "question": "Show me the average temperature at each elevation zone",
+        "sql": "SELECT elevation_zone, AVG(temp_2m_celsius) as avg_temp FROM avalanche_data GROUP BY elevation_zone ORDER BY avg_temp",
+        "expected_answer_contains": ["Alpine", "Nival", "Sub-Alpine"],
+        "category": "AGGREGATION",
+        "difficulty": "easy"
+    },
+    {
+        "id": 3,
+        "question": "Where did heavy snowfall happen with strong wind?",
+        "sql": "SELECT prediction_date, encrypted_lat, snowfall_24h, wind_speed, compound_risk_score FROM avalanche_data WHERE snowfall_24h > 20 AND wind_speed > 10 ORDER BY compound_risk_score DESC",
+        "expected_answer_contains": ["snowfall_24h", "wind_speed"],
+        "category": "SINGLE_TABLE",
+        "difficulty": "medium"
+    },
+    {
+        "id": 4,
+        "question": "How many avalanche predictions per risk level?",
+        "sql": "SELECT risk_scale, COUNT(*) as count FROM avalanche_data GROUP BY risk_scale ORDER BY risk_scale",
+        "expected_answer_contains": ["risk_scale", "count"],
+        "category": "AGGREGATION",
+        "difficulty": "easy"
+    },
+    {
+        "id": 5,
+        "question": "Find areas with freeze-thaw cycling and seismic activity",
+        "sql": "SELECT prediction_date, encrypted_lat, freeze_thaw_cycles_7d, pga, seismic_risk_index, compound_risk_score FROM avalanche_data WHERE freeze_thaw_flag = 1 AND pga > 0.01 ORDER BY compound_risk_score DESC",
+        "expected_answer_contains": ["freeze_thaw", "pga"],
+        "category": "SINGLE_TABLE",
+        "difficulty": "hard"
+    },
+    {
+        "id": 6,
+        "question": "What is the maximum snow depth at each station?",
+        "sql": "SELECT encrypted_lat, MAX(snowdepth) as max_snow_depth, MAX(elevation) as elevation FROM avalanche_data GROUP BY encrypted_lat ORDER BY max_snow_depth DESC",
+        "expected_answer_contains": ["snowdepth"],
+        "category": "AGGREGATION",
+        "difficulty": "easy"
+    },
+    {
+        "id": 7,
+        "question": "Show the latest predictions for extreme risk areas",
+        "sql": "SELECT prediction_date, encrypted_lat, avalanche_probability, risk_scale, compound_risk_score FROM avalanche_data WHERE risk_scale = 5 ORDER BY prediction_date DESC",
+        "expected_answer_contains": ["prediction_date", "risk_scale"],
+        "category": "TEMPORAL",
+        "difficulty": "medium"
+    },
+    {
+        "id": 8,
+        "question": "Which steep slopes had the highest wind loading?",
+        "sql": "SELECT encrypted_lat, slope, wind_speed, wind_loading_index, critical_slope_wind FROM avalanche_data WHERE slope > 35 ORDER BY wind_loading_index DESC LIMIT 10",
+        "expected_answer_contains": ["slope", "wind_loading_index"],
+        "category": "SINGLE_TABLE",
+        "difficulty": "medium"
+    },
+    {
+        "id": 9,
+        "question": "Average compound risk score per elevation zone and month",
+        "sql": "SELECT elevation_zone, substr(prediction_date, 1, 7) as month, AVG(compound_risk_score) as avg_risk FROM avalanche_data GROUP BY elevation_zone, month ORDER BY avg_risk DESC",
+        "expected_answer_contains": ["compound_risk_score", "elevation_zone"],
+        "category": "AGGREGATION",
+        "difficulty": "hard"
+    },
+    {
+        "id": 10,
+        "question": "Show me areas where snow is melting with rain on snow",
+        "sql": "SELECT prediction_date, encrypted_lat, snowmelt, rain_on_snow_ratio, temp_2m_celsius, compound_risk_score FROM avalanche_data WHERE snowmelt > 0 AND rain_on_snow_ratio > 0.1 ORDER BY compound_risk_score DESC",
+        "expected_answer_contains": ["snowmelt", "rain_on_snow"],
+        "category": "SINGLE_TABLE",
+        "difficulty": "hard"
+    }
+]
