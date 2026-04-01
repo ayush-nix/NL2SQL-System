@@ -32,16 +32,17 @@ from typing import Optional
 from config import Config
 from core.schema_introspector import SchemaIntrospector
 from core.query_preprocessor import QueryPreprocessor
-from core.query_planner import QueryPlanner
 from core.schema_linker import SchemaLinker
 from core.sql_generator import SQLGenerator
 from core.sql_executor import SQLExecutor
 from core.answer_synthesizer import AnswerSynthesizer
 from core.cache import QueryCache
-from core.evaluator import LLMJudge, GoldenPairTester
 from core.feedback_loop import FeedbackLoop
-from core.confidence_router import confidence_router
-from core.error_taxonomy import classify_error, build_correction_prompt
+from core.value_grounder import value_grounder
+from core.sql_ranker import sql_ranker
+from core.query_classifier import classify_query
+from core.query_logger import query_logger
+from core.few_shot_retriever import few_shot_retriever
 try:
     from core.column_pruner import column_pruner
     HAS_PRUNER = True
@@ -101,7 +102,6 @@ app.add_middleware(
 # ── Core Components ──────────────────────────────────────────
 introspector = SchemaIntrospector()
 preprocessor = QueryPreprocessor()
-planner = QueryPlanner()
 schema_linker = SchemaLinker()
 generator = SQLGenerator()
 executor = SQLExecutor()
@@ -110,11 +110,10 @@ cache = QueryCache(
     max_size=Config.CACHE_MAX_SIZE,
     ttl_seconds=Config.CACHE_TTL_SECONDS,
 )
-judge = LLMJudge()
-golden_tester = GoldenPairTester(
-    golden_pairs_path=str(Path(__file__).parent / "data" / "golden_pairs.json")
-)
 feedback = FeedbackLoop()
+
+# ── Load golden pairs for dynamic few-shot retrieval ──
+few_shot_retriever.load()
 
 # ── Pre-warm models (keep both in memory to avoid swap latency) ──
 from models.llm_manager import llm_manager as _llm
@@ -229,6 +228,8 @@ async def upload_csvs(files: list[UploadFile] = File(...)):
 
         # Set executor connection
         executor.set_connection(metadata.db_connection)
+        value_grounder.set_connection(metadata.db_connection)
+        sql_ranker.set_connection(metadata.db_connection)
 
         # Clear previous cache
         cache.clear()
@@ -304,6 +305,8 @@ async def load_army_data():
 
         metadata = introspector.load_from_csvs(csv_files)
         executor.set_connection(metadata.db_connection)
+        value_grounder.set_connection(metadata.db_connection)
+        sql_ranker.set_connection(metadata.db_connection)
         cache.clear()
 
         app_state["schema_loaded"] = True
@@ -389,7 +392,7 @@ async def query(req: QueryRequest):
     if not question:
         raise HTTPException(400, "Question cannot be empty")
 
-    # ── Check cache ──────────────────────────────────────────
+    # ── 1. CACHE CHECK (instant) ─────────────────────────────
     if req.use_cache:
         cached = cache.get(question)
         if cached:
@@ -397,113 +400,136 @@ async def query(req: QueryRequest):
             cached["total_time_ms"] = int((time.time() - total_start) * 1000)
             return QueryResponse(**cached)
 
-    # ── Layer 1: Preprocess ───────────────────────────────────
-    preprocessed = preprocessor.preprocess(question)
-    business_hints = preprocessor.get_business_hints(preprocessed)
-
-    # ── Confidence-Based Routing (SOTA: AgenticSQL) ──────────
     metadata = introspector.metadata
-    route = confidence_router.classify(preprocessed, num_tables=len(metadata.tables))
-    logger.info(f"Route: {route['complexity_level']} (score={route['complexity_score']})")
-
-    # ── Layer 1.5: Planner (SKIP for single-table — saves ~10s) ─
-    plan_context = ""
-    planned_question = preprocessed
-    if len(metadata.tables) > 1:
-        try:
-            table_summaries = [
-                f"{t} ({', '.join(c.name for c in metadata.columns.get(t, [])[:10])})"
-                for t in metadata.tables
-            ]
-            plan = await planner.plan(preprocessed, table_summaries)
-            plan_context = planner.build_plan_context(plan)
-            planned_question = plan.get("rewritten_question", preprocessed) or preprocessed
-            logger.info(f"Plan: intent={plan.get('intent')}, steps={len(plan.get('steps', []))}")
-        except Exception as plan_err:
-            logger.warning(f"Planner skipped (non-critical): {plan_err}")
-    else:
-        logger.info("Planner SKIPPED (single-table optimization)")
-
-    # ── Layer 2: Schema Linking ────────────────────────────────
-    # Re-enabled: maps vague user terms → exact column names
-    # Models stay loaded via keep_alive=-1, so no swap penalty
-    linked_question = planned_question
-    target_tables = list(metadata.tables)
     single_table = len(metadata.tables) == 1
 
-    if route["skip_schema_linking"]:
-        logger.info("Schema linking SKIPPED (simple query — confidence routing)")
-    elif single_table:
-        # FAST PATH: domain dict only (no LLM call, instant)
+    # ── 2. PREPROCESS + CLASSIFY (instant, no LLM) ───────────
+    preprocessed = preprocessor.preprocess(question)
+    business_hints = preprocessor.get_business_hints(preprocessed)
+    query_type = classify_query(preprocessed)
+    logger.info(f"Query type: {query_type['types']}, limit={query_type['limit_n']}")
+
+    # Build query hints from classifier
+    query_hints_parts = []
+    for hint in query_type["hints"]:
+        query_hints_parts.append(f"- {hint}")
+    for rule in query_type.get("correlated", []):
+        query_hints_parts.append(f"- For '{rule['keyword']}': use pattern {rule['pattern']}")
+    query_hints_text = "### Query Type Hints\n" + "\n".join(query_hints_parts) if query_hints_parts else ""
+
+    # ── 3. SCHEMA LINKING (domain dict, instant, no LLM) ─────
+    linked_question = preprocessed
+    if single_table:
         try:
-            mapped, _ = schema_linker._dict_lookup(planned_question)
+            mapped, _ = schema_linker._dict_lookup(preprocessed)
             if mapped:
                 for term, (col, cond) in mapped.items():
                     if col:
                         linked_question = linked_question.replace(term, col)
-                logger.info(f"Schema linked (dict-only): {len(mapped)} terms mapped")
-            else:
-                logger.info("Schema linking: no dict matches, using raw question")
+                logger.info(f"Schema linked (dict): {len(mapped)} terms")
         except Exception as link_err:
             logger.warning(f"Dict linking error: {link_err}")
     else:
         try:
-            linked = await schema_linker.link(planned_question, metadata)
-            linked_question = linked.get("resolved_question", planned_question) or planned_question
-            target_tables = linked.get("target_tables", metadata.tables)
-            logger.info(f"Schema linked: {target_tables}, resolved: {linked_question[:80]}")
-        except Exception as link_err:
-            logger.warning(f"Schema linking skipped (non-critical): {link_err}")
+            linked = await schema_linker.link(preprocessed, metadata)
+            linked_question = linked.get("resolved_question", preprocessed) or preprocessed
+        except Exception:
+            pass
 
-    # ── Layer 3: Context Assembly (RAG) ──────────────────────
-    # Column Pruning for wide tables (CHESS Schema Selector pattern)
+    # ── 4. COLUMN PRUNING (instant, no LLM) ──────────────────
     total_cols = sum(len(cols) for cols in metadata.columns.values())
     if HAS_PRUNER and total_cols > 50:
         pruned = column_pruner.prune(preprocessed)
         schema_text = pruned["schema_text"]
-        relationships_text = ""
-        sample_values = ""
-        join_hints = ""
-        logger.info(
-            f"Column pruning: {pruned['pruned_count']}/{pruned['total_columns']} "
-            f"columns selected for query"
-        )
+        selected_cols = [c["name"] for c in pruned["selected_columns"]]
+        logger.info(f"Pruned: {pruned['pruned_count']}/{pruned['total_columns']} cols")
     else:
-        # Standard multi-table context assembly
+        target_tables = list(metadata.tables)
         augmented_tables = metadata.table_graph.get_augmented_tables(
             target_tables, hops=Config.FK_AUGMENTATION_HOPS
         )
         schema_text = introspector.get_schema_text(list(augmented_tables))
-        relationships_text = introspector.get_relationships_text(list(augmented_tables))
-        sample_lines = []
-        for key, vals in metadata.samples.items():
-            tbl = key.split(".")[0]
-            if tbl in augmented_tables:
-                sample_lines.append(f"{key}: {vals[:3]}")
-        sample_values = "\n".join(sample_lines[:30]) if sample_lines else ""
-        join_hints_list = metadata.table_graph.get_join_hints(list(augmented_tables))
-        join_hints = "\n".join(join_hints_list) if join_hints_list else ""
+        selected_cols = []
+        for t in augmented_tables:
+            selected_cols.extend(c.name for c in metadata.columns.get(t, []))
 
-    # Load learned few-shot examples into generator
-    for ex in feedback.get_learned_examples():
-        generator.add_few_shot(ex["question"], ex["sql"])
+    # ── 5. VALUE GROUNDING (DB queries, ~1ms) ────────────────
+    grounding_text = ""
+    if selected_cols:
+        # Ground only key columns mentioned in the query
+        key_cols = [c for c in selected_cols if any(
+            kw in c.lower() for kw in
+            ["prediction", "risk", "elevation", "zone", "flag", "positive"]
+        )][:10]
+        if key_cols:
+            table_name = list(metadata.tables)[0] if single_table else "avalanche_data"
+            grounding = value_grounder.ground_values(key_cols, table_name)
+            grounding_text = value_grounder.build_grounding_text(grounding)
+            logger.info(f"Grounded {len(grounding)} columns with actual values")
 
-    # ── Layer 4: SQL Generation (ONLY LLM call for single-table) ──
+    # ── 5.5 TEMPLATE CACHE CHECK (instant, 0 LLM calls) ────────
+    template_sql = few_shot_retriever.get_template_match(preprocessed)
+    if template_sql:
+        from core.sql_validator import validate_sql as _val
+        tv = _val(template_sql, metadata)
+        if tv.passed:
+            logger.info("Template cache HIT — returning cached SQL")
+            exec_result = executor.execute(template_sql)
+            if exec_result.get("success"):
+                answer = await synthesizer.synthesize(
+                    question=preprocessed, sql=template_sql,
+                    results=exec_result, use_llm=False,
+                )
+                total_time = int((time.time() - total_start) * 1000)
+                response_data = {
+                    "question": question, "preprocessed_question": preprocessed,
+                    "linked_question": linked_question, "sql": template_sql,
+                    "valid": True, "results": exec_result, "answer": answer,
+                    "confidence": 0.95, "query_type": "template_cache",
+                    "cached": False, "generation_time_ms": 0,
+                    "execution_time_ms": exec_result.get("execution_time_ms", 0),
+                    "total_time_ms": total_time, "attempts": 0,
+                    "model_used": "template_cache", "evaluation": {},
+                }
+                cache.put(question, response_data)
+                query_logger.log(question=question, sql=template_sql,
+                    success=True, execution_time_ms=total_time, model_used="template_cache")
+                return QueryResponse(**response_data)
+
+    # ── 5.6 DYNAMIC FEW-SHOT RETRIEVAL (~1ms) ────────────────
+    dynamic_examples = few_shot_retriever.build_few_shot_text(preprocessed, k=2)
+    logger.info(f"Dynamic few-shot: {len(dynamic_examples)} chars of examples")
+
+    # ── 6. SQL GENERATION (k=2 candidates, sqlcoder) ─────────
     gen_result = await generator.generate(
         question=linked_question,
         schema_text=schema_text,
-        relationships_text=relationships_text,
-        sample_values=sample_values,
-        join_hints=join_hints,
         business_hints=business_hints,
         schema_metadata=metadata,
-        plan_context=plan_context,
+        value_grounding=grounding_text,
+        query_hints=query_hints_text,
+        dynamic_examples=dynamic_examples,
     )
 
-    sql = gen_result["sql"]
     generation_time = gen_result["generation_time_ms"]
 
-    # ── Stage 5-6: Execute ───────────────────────────────────
+    # ── 7. RANK CANDIDATES (code-only, ~5ms) ─────────────────
+    valid_candidates = gen_result.get("all_candidates", [])
+    valid_sqls = [c["sql"] for c in valid_candidates if c.get("valid")]
+
+    if len(valid_sqls) > 1:
+        rank_result = sql_ranker.rank(valid_sqls, question, metadata)
+        sql = rank_result["best_sql"]
+        confidence = rank_result["confidence"]
+        logger.info(f"Ranked {len(valid_sqls)} candidates, best score: {rank_result['score']}")
+    elif valid_sqls:
+        sql = valid_sqls[0]
+        confidence = gen_result["confidence"]
+    else:
+        sql = gen_result["sql"]
+        confidence = gen_result["confidence"]
+
+    # ── 8. EXECUTE ───────────────────────────────────────────
     exec_result = {"success": False, "error": "SQL validation failed",
                    "columns": [], "rows": [], "row_count": 0,
                    "execution_time_ms": 0}
@@ -511,64 +537,56 @@ async def query(req: QueryRequest):
     if gen_result["valid"] and sql:
         exec_result = executor.execute(sql)
 
-        # If execution fails, try TAXONOMY-GUIDED self-correction
-        if not exec_result["success"] and gen_result["attempts"] <= Config.MAX_RETRIES:
-            error_info = classify_error(exec_result.get("error", ""))
-            logger.info(
-                f"Taxonomy correction: {error_info['error_type']} "
-                f"({error_info['category']} → {error_info['subcategory']})"
-            )
-            correction_prompt = build_correction_prompt(
-                failed_sql=sql,
-                error_info=error_info,
-                question=preprocessed,
-                schema_text=schema_text,
-            )
+        # Execution-based self-correction: if error, retry with feedback
+        if not exec_result["success"]:
+            db_error = exec_result.get("error", "")
+            logger.info(f"Execution error: {db_error[:100]}. Retrying...")
             try:
                 from models.llm_manager import llm_manager
                 from core.sql_validator import extract_clean_sql, validate_sql
+                fix_prompt = (
+                    f"The SQL below failed when executed:\n\n{sql}\n\n"
+                    f"Database error: {db_error}\n\n"
+                    f"Question: \"{question}\"\n\n{schema_text}\n\n"
+                    f"Fix the SQL. Use ONLY columns from the CREATE TABLE.\n"
+                    f"Return ONLY the corrected SQL:"
+                )
                 raw_fix = await llm_manager.generate(
-                    prompt=correction_prompt,
+                    prompt=fix_prompt,
                     model=Config.SQL_MODEL,
                     temperature=0.1,
                 )
                 fixed_sql = extract_clean_sql(raw_fix)
-                validation = validate_sql(fixed_sql, metadata)
-                if validation.passed:
+                val = validate_sql(fixed_sql, metadata)
+                if val.passed:
                     sql = fixed_sql
                     exec_result = executor.execute(sql)
+                    logger.info(f"Self-correction {'succeeded' if exec_result['success'] else 'failed'}")
             except Exception as fix_err:
-                logger.error(f"Taxonomy fix attempt failed: {fix_err}")
+                logger.error(f"Self-correction failed: {fix_err}")
+
+        # Empty result retry: relax filters
+        if exec_result["success"] and exec_result.get("row_count", 0) == 0:
+            logger.info("Query returned 0 rows — may need relaxed filters")
 
     execution_time = exec_result.get("execution_time_ms", 0)
 
-    # ── Stage 7: Answer (smart template — no model swap, instant) ──
+    # ── 9. ANSWER (smart template, instant) ──────────────────
     answer = ""
     if exec_result.get("success"):
-        try:
-            answer = await synthesizer.synthesize(
-                question=preprocessed,
-                sql=sql,
-                results=exec_result,
-                use_llm=False,  # Fast mode — no model swap
-            )
-        except Exception as synth_err:
-            logger.warning(f"Synthesis fallback: {synth_err}")
-            answer = synthesizer._fallback_answer(
-                exec_result.get("columns", []),
-                exec_result.get("rows", []),
-                exec_result.get("row_count", 0),
-            )
+        answer = await synthesizer.synthesize(
+            question=preprocessed, sql=sql,
+            results=exec_result, use_llm=False,
+        )
     elif not gen_result["valid"]:
         answer = (
-            f"I couldn't generate a valid SQL query for your question. "
+            f"I couldn't generate a valid SQL query. "
             f"Error: {gen_result.get('validation_error', 'Unknown')}. "
             f"Please try rephrasing."
         )
     else:
         answer = (
-            f"The query encountered an error: "
-            f"{exec_result.get('error', 'Unknown')}. "
+            f"Query error: {exec_result.get('error', 'Unknown')}. "
             f"Please try rephrasing your question."
         )
 
