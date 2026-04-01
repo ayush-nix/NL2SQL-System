@@ -414,7 +414,9 @@ async def query(req: QueryRequest):
     for hint in query_type["hints"]:
         query_hints_parts.append(f"- {hint}")
     for rule in query_type.get("correlated", []):
-        query_hints_parts.append(f"- For '{rule['keyword']}': use pattern {rule['pattern']}")
+        query_hints_parts.append(f"- {rule['pattern']}")
+    if "TEMPORAL" in query_type["types"]:
+        query_hints_parts.append("- Use DATE('now', '-N days') for time filters (SQLite)")
     query_hints_text = "### Query Type Hints\n" + "\n".join(query_hints_parts) if query_hints_parts else ""
 
     # ── 3. SCHEMA LINKING (domain dict, instant, no LLM) ─────

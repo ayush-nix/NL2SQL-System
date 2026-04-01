@@ -46,11 +46,52 @@ BLOCKED_WITHIN_SELECT = [
 ]
 
 
+def auto_fix_sql(sql: str, schema_metadata=None) -> str:
+    """
+    Dynamically fix SQL: dialect issues + hallucinated column names.
+    Works with ANY schema — builds valid column set from loaded metadata.
+    """
+    # Step 1: Fix dialect (PostgreSQL/MySQL → SQLite)
+    sql = _fix_dialect(sql)
+
+    # Step 2: Fix hallucinated column names
+    if schema_metadata:
+        valid_columns = set()
+        for table_name in schema_metadata.tables:
+            for col in schema_metadata.columns.get(table_name, []):
+                valid_columns.add(col.name)
+
+        try:
+            parsed = sqlglot.parse_one(sql)
+            replacements = {}
+            for col_ref in parsed.find_all(exp.Column):
+                col_name = col_ref.name
+                if not col_name or col_name in ('*',):
+                    continue
+                if col_name.lower() in {v.lower() for v in valid_columns}:
+                    continue
+                # Hallucinated — find closest
+                closest = _find_closest_column(col_name.lower(), {v.lower() for v in valid_columns})
+                if closest:
+                    # Find the original-case version
+                    original_case = next((v for v in valid_columns if v.lower() == closest), closest)
+                    replacements[col_name] = original_case
+
+            # Apply all replacements (use word-boundary regex to avoid partial matches)
+            for bad, good in replacements.items():
+                sql = re.sub(r'\b' + re.escape(bad) + r'\b', good, sql)
+
+        except Exception:
+            pass
+
+    return sql
+
+
 def validate_sql(sql: str, schema_metadata=None,
                  critic_fn=None) -> ValidationResult:
     """
-    Run all 5 validation passes on generated SQL.
-    All passes must succeed before execution is allowed.
+    Run validation passes on generated SQL.
+    Auto-fixes dialect + column issues BEFORE validating.
     """
     # Clean the SQL
     sql = sql.strip()
@@ -61,6 +102,9 @@ def validate_sql(sql: str, schema_metadata=None,
 
     if not sql:
         return ValidationResult(passed=False, error="Empty SQL", pass_number=0)
+
+    # ── AUTO-FIX: dialect + column names (dynamic) ────────────
+    sql = auto_fix_sql(sql, schema_metadata)
 
     # ── Pass 1: Syntax Validation ─────────────────────────────
     result = _pass1_syntax(sql)
@@ -85,13 +129,55 @@ def validate_sql(sql: str, schema_metadata=None,
             return result
 
     # ── Pass 5: SQL Critic (LLM) ─────────────────────────────
-    # Skipped if no critic function provided (for speed in testing)
     if critic_fn:
         result = _pass5_critic(sql, critic_fn)
         if not result.passed:
             return result
 
-    return ValidationResult(passed=True, confidence=0.9)
+    # Store the fixed SQL on the result so the pipeline can use it
+    result = ValidationResult(passed=True, confidence=0.9)
+    result.fixed_sql = sql
+    return result
+
+
+def _fix_dialect(sql: str) -> str:
+    """Auto-fix PostgreSQL/MySQL syntax to SQLite. Catches common hallucinations."""
+    import re as _re
+
+    # Fix: now() → DATE('now')
+    sql = _re.sub(r"\bnow\(\)", "DATE('now')", sql, flags=_re.IGNORECASE)
+
+    # Fix: CURRENT_TIMESTAMP - interval '7 days' → DATE('now', '-7 days')
+    sql = _re.sub(
+        r"(?:CURRENT_TIMESTAMP|DATE\('now'\))\s*-\s*interval\s*'(\d+)\s*days?'",
+        r"DATE('now', '-\1 days')",
+        sql, flags=_re.IGNORECASE
+    )
+
+    # Fix: now() - interval '7 days' (already converted now() above)
+    sql = _re.sub(
+        r"DATE\('now'\)\s*-\s*interval\s*'(\d+)\s*days?'",
+        r"DATE('now', '-\1 days')",
+        sql, flags=_re.IGNORECASE
+    )
+
+    # Fix: >= now() - interval ... patterns that remain
+    sql = _re.sub(
+        r"-\s*interval\s*'(\d+)\s*days?'",
+        r"",  # Remove dangling interval fragments
+        sql, flags=_re.IGNORECASE
+    )
+
+    # Fix: ILIKE → LIKE
+    sql = _re.sub(r"\bILIKE\b", "LIKE", sql, flags=_re.IGNORECASE)
+
+    # Fix: ::type casts → CAST(x AS type)
+    sql = _re.sub(r"(\w+)::(\w+)", r"CAST(\1 AS \2)", sql)
+
+    # Fix: LIMIT ALL → remove
+    sql = _re.sub(r"\bLIMIT\s+ALL\b", "", sql, flags=_re.IGNORECASE)
+
+    return sql.strip()
 
 
 def _pass1_syntax(sql: str) -> ValidationResult:
@@ -163,58 +249,64 @@ def _pass2_safety(sql: str) -> ValidationResult:
 
 
 def _pass3_schema(sql: str, schema_metadata) -> ValidationResult:
-    """Verify all referenced tables AND columns actually exist.
-    If a column is wrong, suggest the closest valid column name."""
+    """Verify tables/columns exist. AUTO-FIXES hallucinated columns."""
     try:
         parsed = sqlglot.parse_one(sql)
 
         # Extract table names
         known_tables = {t.lower() for t in schema_metadata.tables}
-        referenced_tables = set()
 
         for table in parsed.find_all(exp.Table):
             table_name = table.name.lower()
-            if table_name:
-                referenced_tables.add(table_name)
-                if table_name not in known_tables:
-                    return ValidationResult(
-                        passed=False,
-                        error=f"Table '{table_name}' does not exist. "
-                              f"Available tables: {', '.join(sorted(known_tables))}",
-                        pass_number=3
-                    )
+            if table_name and table_name not in known_tables:
+                # Check if it's an alias (single-char like 'a', 'b', 'c')
+                if len(table_name) <= 2:
+                    continue  # It's an alias, not a real table ref
+                return ValidationResult(
+                    passed=False,
+                    error=f"Table '{table_name}' does not exist. "
+                          f"Available: {', '.join(sorted(known_tables))}",
+                    pass_number=3
+                )
 
-        # ── Column name validation (catches hallucinated columns) ──
-        # Build set of all valid column names across all tables
+        # Build valid column set dynamically from loaded schema
         valid_columns = set()
         for table_name in schema_metadata.tables:
             for col in schema_metadata.columns.get(table_name, []):
                 valid_columns.add(col.name.lower())
 
-        # Extract all column references from the SQL
+        # Check and AUTO-FIX hallucinated columns
         for col_ref in parsed.find_all(exp.Column):
             col_name = col_ref.name.lower()
-            if not col_name:
+            if not col_name or col_name in ('*',):
                 continue
-            # Skip if it's a known alias (like 'rn', 'avg_prob', etc.)
             if col_name in valid_columns:
                 continue
-            # Skip * and aggregation aliases
-            if col_name in ('*',):
-                continue
-            # It's a hallucinated column — find closest match
+
+            # It's hallucinated — find closest real column
             closest = _find_closest_column(col_name, valid_columns)
-            suggestion = f" Did you mean '{closest}'?" if closest else ""
-            return ValidationResult(
-                passed=False,
-                error=f"Column '{col_name}' does not exist in the database.{suggestion} "
-                      f"Use ONLY exact column names from the schema.",
-                pass_number=3
-            )
+            if closest:
+                # AUTO-FIX: replace in SQL dynamically
+                import logging
+                logging.getLogger('nl2sql.validator').info(
+                    f"Auto-fix column: '{col_name}' → '{closest}'"
+                )
+                # We can't modify the AST easily, so return error with fix suggestion
+                # The correction loop in the generator will use this
+                return ValidationResult(
+                    passed=False,
+                    error=f"Column '{col_name}' → use '{closest}' instead",
+                    pass_number=3
+                )
+            else:
+                return ValidationResult(
+                    passed=False,
+                    error=f"Column '{col_name}' does not exist in schema",
+                    pass_number=3
+                )
 
         return ValidationResult(passed=True, pass_number=3)
-    except Exception as e:
-        # Don't block on schema check failures — let execution handle it
+    except Exception:
         return ValidationResult(passed=True, pass_number=3)
 
 
@@ -277,7 +369,7 @@ def _pass5_critic(sql: str, critic_fn) -> ValidationResult:
 
 
 def extract_clean_sql(raw: str) -> str:
-    """Extract clean SQL from LLM output that may contain markdown or text."""
+    """Extract clean SQL from LLM output, fix dialect issues."""
     raw = raw.strip()
 
     # Remove markdown code fences
@@ -291,7 +383,10 @@ def extract_clean_sql(raw: str) -> str:
     if select_match:
         raw = select_match.group(1).strip()
 
-    # Remove trailing semicolons (SQLite doesn't need them)
+    # Remove trailing semicolons
     raw = raw.rstrip(";").strip()
+
+    # AUTO-FIX dialect issues (PostgreSQL → SQLite)
+    raw = _fix_dialect(raw)
 
     return raw

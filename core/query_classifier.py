@@ -53,15 +53,17 @@ AGG_RULES = {
     "how many": "COUNT(*)",
 }
 
-# Correlated query keywords → SQL patterns
+# Correlated query keywords → concrete SQL template examples
 CORRELATED_RULES = {
-    "higher than": "> (SELECT AVG({col}) FROM {table})",
-    "above average": "> (SELECT AVG({col}) FROM {table})",
-    "below average": "< (SELECT AVG({col}) FROM {table})",
-    "lower than average": "< (SELECT AVG({col}) FROM {table})",
-    "greater than average": "> (SELECT AVG({col}) FROM {table})",
-    "more than average": "> (SELECT AVG({col}) FROM {table})",
-    "higher than the overall": "> (SELECT AVG({col}) FROM {table})",
+    "higher than": "MUST use correlated subquery with alias: SELECT * FROM avalanche_data a WHERE a.col > (SELECT AVG(b.col) FROM avalanche_data b WHERE b.other_col < a.other_col)",
+    "above average": "MUST use subquery: WHERE col > (SELECT AVG(col) FROM avalanche_data)",
+    "below average": "MUST use subquery: WHERE col < (SELECT AVG(col) FROM avalanche_data)",
+    "lower than average": "MUST use subquery: WHERE col < (SELECT AVG(col) FROM avalanche_data)",
+    "greater than average": "MUST use subquery: WHERE col > (SELECT AVG(col) FROM avalanche_data)",
+    "more than average": "MUST use subquery: WHERE col > (SELECT AVG(col) FROM avalanche_data)",
+    "higher than the overall": "MUST use subquery: WHERE col > (SELECT AVG(col) FROM avalanche_data)",
+    "above average of": "MUST use correlated subquery with alias: SELECT * FROM avalanche_data a WHERE a.col > (SELECT AVG(b.col) FROM avalanche_data b WHERE b.other < a.other)",
+    "higher than records with": "MUST use correlated subquery with alias: SELECT * FROM avalanche_data a WHERE a.col > (SELECT AVG(b.col) FROM avalanche_data b WHERE b.other < a.other)",
 }
 
 

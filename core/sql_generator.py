@@ -25,7 +25,7 @@ class SQLGenerator:
 Generate a SQL query to answer the following question:
 "{question}"
 
-### Database Schema
+### Database Schema (USE ONLY THESE EXACT COLUMN NAMES)
 {schema}
 
 {value_grounding}
@@ -37,11 +37,22 @@ Generate a SQL query to answer the following question:
 ### Reference Examples
 {dynamic_examples}
 
-### Rules
-1. Generate ONLY a SELECT statement.
-2. Use EXACT column names from the CREATE TABLE above. Do NOT invent column names.
-3. Use SQLite syntax: LIMIT (not TOP), no ILIKE (use LIKE).
-4. Return ONLY the SQL query — no explanation, no markdown fences.
+### STRICT RULES (violations = rejected)
+1. Return ONLY a SELECT statement. No explanation, no markdown.
+2. Use ONLY column names from the CREATE TABLE above. NEVER invent columns.
+   - WRONG: snow_depth, wind_speed, temperature
+   - RIGHT: snow_depth_change_48h, wind_speed_change_24h, temp_trend_7d
+3. SQLite ONLY. BANNED syntax:
+   - now() → use DATE('now')
+   - interval '7 days' → use DATE('now', '-7 days')
+   - ILIKE → use LIKE
+   - TOP N → use LIMIT N
+   - :: cast → use CAST(x AS type)
+4. For "higher than average" / "lower than" / "above average of":
+   Use a CORRELATED subquery with table alias:
+   SELECT * FROM avalanche_data a
+   WHERE a.col > (SELECT AVG(b.col) FROM avalanche_data b WHERE b.other < a.other)
+5. LIMIT results to 100 unless the question asks for a specific count.
 
 ### SQL Query:
 """
@@ -107,6 +118,9 @@ Fix the error and return ONLY the corrected SQL query:
                 )
                 sql = extract_clean_sql(raw)
                 validation = validate_sql(sql, schema_metadata)
+                # Use auto-fixed SQL if validator corrected it
+                if validation.passed and hasattr(validation, 'fixed_sql') and validation.fixed_sql:
+                    sql = validation.fixed_sql
 
                 candidates.append({
                     "sql": sql,
